@@ -4,14 +4,18 @@ import argparse
 import ctypes
 import json
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 
 DLL_DIR_HANDLES: list[Any] = []
 VIDEO_EXTENSIONS = {".webm", ".mp4", ".mkv", ".mov", ".avi", ".m4v"}
+DEFAULT_GLOSSARY_PATH = Path(__file__).with_name("concept_glossary.json")
+CONCEPT_STYLE_CHOICES = {"auto", "plain", "ko", "ko_en", "en_ko"}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -32,6 +36,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--beam-size", type=int, default=5, help="Beam size for transcription.")
     parser.add_argument("--prompt-hint", default="", help="Optional hint to improve terminology.")
     parser.add_argument("--translate-to", default="", help="Translate transcript to target language code, e.g. ko.")
+    parser.add_argument(
+        "--concept-style",
+        default="auto",
+        choices=sorted(CONCEPT_STYLE_CHOICES),
+        help="How to render glossary concepts during translation. "
+        "Examples: ko_en -> 강화학습(reinforcement learning), en_ko -> reinforcement learning(강화학습).",
+    )
+    parser.add_argument(
+        "--glossary-path",
+        default="",
+        help="Optional JSON glossary path. Defaults to concept_glossary.json next to this script.",
+    )
     parser.add_argument("--keep-audio", action="store_true", help="Keep the downloaded audio file.")
     parser.add_argument("--self-check", action="store_true", help="Check required packages and exit.")
     return parser
@@ -229,6 +245,24 @@ def build_output_stem(output_dir: Path, info: dict[str, Any]) -> Path:
     return output_dir / sanitize_output_name(str(slug))
 
 
+def extract_youtube_id(url: str) -> str | None:
+    parsed = urlparse(url.strip())
+    host = parsed.netloc.lower()
+    path_parts = [part for part in parsed.path.split("/") if part]
+
+    if host in {"youtu.be", "www.youtu.be"} and path_parts:
+        return path_parts[0]
+
+    if host.endswith("youtube.com") or host.endswith("youtube-nocookie.com"):
+        video_ids = parse_qs(parsed.query).get("v")
+        if video_ids:
+            return video_ids[0]
+        if len(path_parts) >= 2 and path_parts[0] in {"shorts", "live", "embed"}:
+            return path_parts[1]
+
+    return None
+
+
 def write_srt(segments: list[dict[str, Any]], path: Path) -> None:
     parts: list[str] = []
     for idx, item in enumerate(segments, 1):
@@ -272,10 +306,247 @@ def chunk_for_translation(text: str, max_len: int = 4000) -> list[str]:
     return pieces or [text[:max_len]]
 
 
+def normalize_concept_style(target_language: str, concept_style: str) -> str:
+    style = (concept_style or "auto").strip().lower()
+    if style not in CONCEPT_STYLE_CHOICES:
+        raise ValueError(f"Unsupported concept style: {concept_style}")
+    if style == "auto":
+        return "ko_en" if target_language.strip().lower().startswith("ko") else "plain"
+    return style
+
+
+def load_concept_glossary(glossary_path: str | Path | None = None) -> list[dict[str, Any]]:
+    path = Path(glossary_path).resolve() if glossary_path else DEFAULT_GLOSSARY_PATH
+    if not path.exists():
+        return []
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, list):
+        raise RuntimeError(f"Glossary file must contain a JSON list: {path}")
+
+    out: list[dict[str, Any]] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+
+        english = segment_text(str(item.get("en", "")))
+        korean = segment_text(str(item.get("ko", "")))
+        if not english or not korean:
+            continue
+
+        aliases = [
+            segment_text(str(alias))
+            for alias in item.get("aliases", [])
+            if segment_text(str(alias))
+        ]
+        max_length = max(len(term) for term in [english, *aliases])
+        out.append(
+            {
+                "en": english,
+                "ko": korean,
+                "aliases": aliases,
+                "max_length": max_length,
+            }
+        )
+
+    out.sort(key=lambda entry: entry["max_length"], reverse=True)
+    return out
+
+
+def render_concept_term(entry: dict[str, Any], concept_style: str, matched_surface: str | None = None) -> str:
+    english_surface = segment_text(matched_surface or entry["en"])
+    korean = entry["ko"]
+    if concept_style == "ko":
+        return korean
+    if concept_style == "ko_en":
+        return f"{korean}({english_surface})"
+    if concept_style == "en_ko":
+        return f"{english_surface}({korean})"
+    return english_surface
+
+
+def compile_concept_pattern(term: str) -> re.Pattern[str]:
+    escaped = re.escape(term)
+    return re.compile(rf"(?<![A-Za-z0-9]){escaped}(?![A-Za-z0-9])", re.IGNORECASE)
+
+
+def protect_concept_terms(
+    text: str,
+    glossary: list[dict[str, Any]],
+    concept_style: str,
+) -> tuple[str, dict[str, str]]:
+    protected = text
+    replacements: dict[str, str] = {}
+    counter = 0
+
+    for entry in glossary:
+        variants = [entry["en"], *entry["aliases"]]
+        for variant in variants:
+            pattern = compile_concept_pattern(variant)
+
+            def replace(match: re.Match[str]) -> str:
+                nonlocal counter
+                token = f"YTSUBTERM{counter}TOKEN"
+                replacements[token] = render_concept_term(entry, concept_style, match.group(0))
+                counter += 1
+                return token
+
+            protected = pattern.sub(replace, protected)
+
+    return protected, replacements
+
+
+def restore_concept_tokens(text: str, replacements: dict[str, str]) -> str:
+    restored = text
+    for token, value in replacements.items():
+        restored = re.sub(re.escape(token), value, restored, flags=re.IGNORECASE)
+    return restored
+
+
+def build_translation_metadata(
+    target_language: str,
+    concept_style: str,
+    glossary_path: str | Path | None = None,
+) -> dict[str, str]:
+    target = target_language.strip().lower()
+    style = normalize_concept_style(target, concept_style)
+    glossary_name = ""
+    if style != "plain":
+        glossary_candidate = Path(glossary_path).resolve() if glossary_path else DEFAULT_GLOSSARY_PATH
+        if glossary_candidate.exists():
+            glossary_name = glossary_candidate.name
+    return {
+        "target_language": target,
+        "concept_style": style,
+        "glossary_name": glossary_name,
+    }
+
+
+def existing_output_paths(stem: Path) -> dict[str, Path]:
+    outputs: dict[str, Path] = {}
+
+    base_files = {
+        "srt": stem.with_suffix(".srt"),
+        "txt": stem.with_suffix(".txt"),
+        "json": stem.with_suffix(".json"),
+        "vtt": stem.with_suffix(".vtt"),
+    }
+    for key, path in base_files.items():
+        if path.exists():
+            outputs[key] = path
+
+    for candidate in sorted(stem.parent.glob(stem.name + ".*")):
+        if not candidate.is_file():
+            continue
+        suffixes = candidate.suffixes
+        if len(suffixes) >= 2 and suffixes[-1].lower() in {".srt", ".txt", ".vtt"}:
+            tag = suffixes[-2].lstrip(".").lower()
+            ext = suffixes[-1].lstrip(".").lower()
+            if tag:
+                outputs[f"{ext}_{tag}"] = candidate
+
+    return outputs
+
+
+def load_saved_job(url: str, output_dir: str | Path) -> dict[str, Any] | None:
+    output_dir = Path(output_dir).resolve()
+    video_id = extract_youtube_id(url)
+
+    for json_path in sorted(output_dir.glob("*.json")):
+        try:
+            payload = json.loads(json_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+
+        source = payload.get("source", {})
+        if not isinstance(source, dict):
+            continue
+
+        source_id = source.get("id")
+        source_url = source.get("webpage_url")
+        matched = source_id == video_id if video_id else source_url == url
+        if not matched:
+            continue
+
+        stem = json_path.with_suffix("")
+        info = {
+            "title": source.get("title"),
+            "id": source.get("id"),
+            "webpage_url": source.get("webpage_url"),
+        }
+        meta = payload.get("meta", {}) if isinstance(payload.get("meta", {}), dict) else {}
+        segments = payload.get("segments", []) if isinstance(payload.get("segments", []), list) else []
+        return {
+            "info": info,
+            "meta": meta,
+            "segments": segments,
+            "stem": stem,
+            "outputs": existing_output_paths(stem),
+        }
+
+    return None
+
+
+def has_base_outputs(outputs: dict[str, Path]) -> bool:
+    return all(key in outputs for key in ("srt", "txt", "json"))
+
+
+def has_translation_outputs(outputs: dict[str, Path], target_language: str) -> bool:
+    tag = target_language.strip().lower()
+    return all(key in outputs for key in (f"srt_{tag}", f"txt_{tag}"))
+
+
+def translation_metadata_matches(
+    saved_meta: dict[str, Any],
+    target_language: str,
+    concept_style: str,
+    glossary_path: str | Path | None = None,
+) -> bool:
+    requested = build_translation_metadata(target_language, concept_style, glossary_path)
+    saved_translation = saved_meta.get("translation", {}) if isinstance(saved_meta.get("translation", {}), dict) else {}
+    if not saved_translation:
+        return False
+    return (
+        saved_translation.get("target_language") == requested["target_language"]
+        and saved_translation.get("concept_style") == requested["concept_style"]
+        and (saved_translation.get("glossary_name") or "") == requested["glossary_name"]
+    )
+
+
+def find_existing_downloaded_media(
+    url: str,
+    output_dir: str | Path,
+    media_kind: str,
+) -> tuple[Path, dict[str, Any]] | None:
+    output_dir = Path(output_dir).resolve()
+    media_dir = output_dir / media_kind
+    if not media_dir.exists():
+        return None
+
+    saved_job = load_saved_job(url, output_dir)
+    candidate_ids: list[str] = []
+    if saved_job and saved_job["info"].get("id"):
+        candidate_ids.append(str(saved_job["info"]["id"]))
+    parsed_id = extract_youtube_id(url)
+    if parsed_id and parsed_id not in candidate_ids:
+        candidate_ids.append(parsed_id)
+
+    for video_id in candidate_ids:
+        matches = [path for path in media_dir.iterdir() if path.is_file() and f"[{video_id}]" in path.name]
+        if matches:
+            selected = sorted(matches)[0].resolve()
+            info = saved_job["info"] if saved_job else {"title": selected.stem, "id": video_id, "webpage_url": url}
+            return selected, info
+
+    return None
+
+
 def translate_segments(
     segments: list[dict[str, Any]],
     source_language: str,
     target_language: str,
+    concept_style: str = "auto",
+    glossary_path: str | Path | None = None,
 ) -> list[dict[str, Any]]:
     try:
         from deep_translator import GoogleTranslator
@@ -293,11 +564,18 @@ def translate_segments(
     if src.lower() == target:
         return segments
 
+    resolved_concept_style = normalize_concept_style(target, concept_style)
+    glossary = load_concept_glossary(glossary_path) if resolved_concept_style != "plain" else []
+
     translator = GoogleTranslator(source=src, target=target)
     cache: dict[str, str] = {}
     out: list[dict[str, Any]] = []
 
     print(f"Translating subtitles: {src} -> {target}")
+    if glossary:
+        glossary_origin = Path(glossary_path).resolve() if glossary_path else DEFAULT_GLOSSARY_PATH
+        print(f"Concept style    : {resolved_concept_style}")
+        print(f"Concept glossary : {glossary_origin}")
 
     for item in segments:
         text = segment_text(item["text"])
@@ -308,14 +586,29 @@ def translate_segments(
         if text in cache:
             translated = cache[text]
         else:
+            protected_text = text
+            replacements: dict[str, str] = {}
+            if glossary:
+                protected_text, replacements = protect_concept_terms(
+                    text,
+                    glossary=glossary,
+                    concept_style=resolved_concept_style,
+                )
+
             translated_parts: list[str] = []
-            for chunk in chunk_for_translation(text):
+            for chunk in chunk_for_translation(protected_text):
                 try:
                     translated_piece = translator.translate(chunk)
                 except Exception:
                     translated_piece = chunk
-                translated_parts.append(segment_text(translated_piece or chunk))
+                restored_piece = restore_concept_tokens(
+                    segment_text(translated_piece or chunk),
+                    replacements,
+                )
+                translated_parts.append(restored_piece)
+
             translated = " ".join(part for part in translated_parts if part).strip() or text
+            translated = restore_concept_tokens(translated, replacements)
             cache[text] = translated
 
         translated_item = dict(item)
@@ -332,6 +625,12 @@ def download_media(url: str, output_dir: str | Path, media_kind: str) -> tuple[P
     local_candidate = Path(url)
     if local_candidate.exists() and local_candidate.is_file():
         return local_candidate.resolve(), {"title": local_candidate.stem, "id": local_candidate.stem}, False
+
+    existing_media = find_existing_downloaded_media(url, output_dir, media_kind)
+    if existing_media is not None:
+        media_path, info = existing_media
+        print(f"Reusing existing {media_kind}: {media_path}")
+        return media_path, info, False
 
     if media_kind == "audio":
         download_dir = output_dir / "audio"
@@ -485,6 +784,9 @@ def save_outputs(
     meta: dict[str, Any],
     translated_segments: list[dict[str, Any]] | None = None,
     translate_to: str = "",
+    concept_style: str = "auto",
+    glossary_path: str | Path | None = None,
+    translation_metadata: dict[str, str] | None = None,
 ) -> dict[str, Path]:
     stem = build_output_stem(output_dir, info)
     srt_path = stem.with_suffix(".srt")
@@ -493,13 +795,24 @@ def save_outputs(
 
     write_srt(segments, srt_path)
     write_txt(segments, txt_path)
+    json_meta = dict(meta)
+    json_meta.pop("translation", None)
+    if translation_metadata:
+        json_meta["translation"] = dict(translation_metadata)
+    elif translated_segments and translate_to:
+        json_meta["translation"] = build_translation_metadata(
+            translate_to,
+            concept_style=concept_style,
+            glossary_path=glossary_path,
+        )
+
     json_payload = {
         "source": {
             "title": info.get("title"),
             "id": info.get("id"),
             "webpage_url": info.get("webpage_url"),
         },
-        "meta": meta,
+        "meta": json_meta,
         "segments": segments,
     }
     json_path.write_text(json.dumps(json_payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -528,14 +841,108 @@ def run_job(
     beam_size: int = 5,
     prompt_hint: str = "",
     translate_to: str = "",
+    concept_style: str = "auto",
+    glossary_path: str | Path | None = None,
     keep_audio: bool = False,
 ) -> dict[str, Any]:
     output_dir = Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    saved_job = load_saved_job(url, output_dir)
+
+    if saved_job and has_base_outputs(saved_job["outputs"]):
+        if not translate_to:
+            print(f"Reusing existing subtitles for URL: {url}")
+            return {
+                "info": saved_job["info"],
+                "meta": saved_job["meta"],
+                "outputs": saved_job["outputs"],
+                "output_dir": output_dir,
+            }
+
+        if has_translation_outputs(saved_job["outputs"], translate_to):
+            requested_translation = build_translation_metadata(
+                translate_to,
+                concept_style,
+                glossary_path,
+            )
+            if translation_metadata_matches(
+                saved_job["meta"],
+                translate_to,
+                concept_style,
+                glossary_path,
+            ):
+                print(f"Reusing existing translated subtitles for URL: {url}")
+                return {
+                    "info": saved_job["info"],
+                    "meta": saved_job["meta"],
+                    "outputs": saved_job["outputs"],
+                    "output_dir": output_dir,
+                }
+
+            saved_translation = (
+                saved_job["meta"].get("translation", {})
+                if isinstance(saved_job["meta"].get("translation", {}), dict)
+                else {}
+            )
+            if not saved_translation:
+                print(f"Reusing existing translated subtitles for URL: {url}")
+                refreshed_job = None
+                outputs = saved_job["outputs"]
+                if saved_job["segments"]:
+                    print("Backfilling missing translation metadata for future runs.")
+                    outputs = save_outputs(
+                        output_dir,
+                        saved_job["info"],
+                        saved_job["segments"],
+                        saved_job["meta"],
+                        translate_to=translate_to,
+                        concept_style=concept_style,
+                        glossary_path=glossary_path,
+                        translation_metadata=requested_translation,
+                    )
+                    refreshed_job = load_saved_job(url, output_dir)
+                return {
+                    "info": saved_job["info"],
+                    "meta": refreshed_job["meta"] if refreshed_job else {**saved_job["meta"], "translation": requested_translation},
+                    "outputs": refreshed_job["outputs"] if refreshed_job else outputs,
+                    "output_dir": output_dir,
+                }
+
     resolved_device = detect_device(device)
     resolved_compute_type = detect_compute_type(resolved_device, compute_type)
     allow_cpu_fallback = device == "auto"
+
+    if saved_job and saved_job["segments"]:
+        print(f"Reusing saved transcript for URL: {url}")
+        translated_segments = None
+        if translate_to:
+            print("Generating only the missing translation outputs.")
+            translated_segments = translate_segments(
+                saved_job["segments"],
+                source_language=saved_job["meta"].get("language", "") or language,
+                target_language=translate_to,
+                concept_style=concept_style,
+                glossary_path=glossary_path,
+            )
+
+        outputs = save_outputs(
+            output_dir,
+            saved_job["info"],
+            saved_job["segments"],
+            saved_job["meta"],
+            translated_segments=translated_segments,
+            translate_to=translate_to,
+            concept_style=concept_style,
+            glossary_path=glossary_path,
+        )
+        refreshed_job = load_saved_job(url, output_dir)
+        return {
+            "info": saved_job["info"],
+            "meta": refreshed_job["meta"] if refreshed_job else saved_job["meta"],
+            "outputs": refreshed_job["outputs"] if refreshed_job else outputs,
+            "output_dir": output_dir,
+        }
 
     downloaded_audio = False
     audio_path: Path | None = None
@@ -559,6 +966,8 @@ def run_job(
                 segments,
                 source_language=meta.get("language", "") or language,
                 target_language=translate_to,
+                concept_style=concept_style,
+                glossary_path=glossary_path,
             )
 
         outputs = save_outputs(
@@ -568,6 +977,8 @@ def run_job(
             meta,
             translated_segments=translated_segments,
             translate_to=translate_to,
+            concept_style=concept_style,
+            glossary_path=glossary_path,
         )
         return {
             "info": info,
@@ -604,6 +1015,8 @@ def main() -> int:
         beam_size=args.beam_size,
         prompt_hint=args.prompt_hint,
         translate_to=args.translate_to,
+        concept_style=args.concept_style,
+        glossary_path=args.glossary_path,
         keep_audio=args.keep_audio,
     )
     print("")

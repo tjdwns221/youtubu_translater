@@ -264,6 +264,8 @@ def ensure_outputs_for_url(
     beam_size: int = 5,
     prompt_hint: str = "",
     translate_to: str = "ko",
+    concept_style: str = "auto",
+    glossary_path: str | Path | None = None,
 ) -> dict[str, Path | dict | str | None]:
     existing = find_outputs_for_url(url, root=root, preferred_language=preferred_language)
     if existing and existing.get("subtitle"):
@@ -283,6 +285,8 @@ def ensure_outputs_for_url(
         beam_size=beam_size,
         prompt_hint=prompt_hint,
         translate_to=translate_to,
+        concept_style=concept_style,
+        glossary_path=glossary_path,
     )
     refreshed = find_outputs_for_url(url, root=root, preferred_language=preferred_language)
     if refreshed:
@@ -311,6 +315,8 @@ def show_video_for_url(
     beam_size: int = 5,
     prompt_hint: str = "",
     translate_to: str = "ko",
+    concept_style: str = "auto",
+    glossary_path: str | Path | None = None,
     base_dir: str | Path | None = None,
 ):
     root = Path(root).resolve()
@@ -328,6 +334,8 @@ def show_video_for_url(
         beam_size=beam_size,
         prompt_hint=prompt_hint,
         translate_to=translate_to,
+        concept_style=concept_style,
+        glossary_path=glossary_path,
     )
 
     video_path = saved.get("video")

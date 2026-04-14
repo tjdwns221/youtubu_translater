@@ -21,6 +21,11 @@ param(
 
     [string]$TranslateTo = "",
 
+    [ValidateSet("auto", "plain", "ko", "ko_en", "en_ko")]
+    [string]$ConceptStyle = "auto",
+
+    [string]$GlossaryPath = "",
+
     [switch]$KeepAudio,
 
     [switch]$SetupOnly,
@@ -130,6 +135,14 @@ if (-not [string]::IsNullOrWhiteSpace($PromptHint)) {
 
 if (-not [string]::IsNullOrWhiteSpace($TranslateTo)) {
     $arguments += @("--translate-to", $TranslateTo)
+}
+
+if (-not [string]::IsNullOrWhiteSpace($ConceptStyle)) {
+    $arguments += @("--concept-style", $ConceptStyle)
+}
+
+if (-not [string]::IsNullOrWhiteSpace($GlossaryPath)) {
+    $arguments += @("--glossary-path", $GlossaryPath)
 }
 
 if ($KeepAudio) {

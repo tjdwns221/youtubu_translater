@@ -10,7 +10,7 @@ from typing import Any
 from flask import Flask, abort, render_template, request, send_from_directory, url_for
 
 from jupyter_video_helper import choose_subtitle_for_stem, find_matching_video, srt_to_vtt
-from youtube_subtitle_cli import download_video, run_job
+from youtube_subtitle_cli import CONCEPT_STYLE_CHOICES, download_video, run_job
 
 
 APP_ROOT = Path(__file__).resolve().parent
@@ -24,6 +24,7 @@ DEFAULT_FORM = {
     "model": "medium",
     "language": "",
     "translate_to": "ko",
+    "concept_style": "ko_en",
     "device": "cuda",
     "compute_type": "float16",
     "beam_size": "5",
@@ -147,17 +148,24 @@ def normalize_form_data(form: Any) -> dict[str, Any]:
     beam_size = str(form.get("beam_size", DEFAULT_FORM["beam_size"])).strip() or DEFAULT_FORM["beam_size"]
     device = str(form.get("device", DEFAULT_FORM["device"])).strip().lower()
     compute_type = str(form.get("compute_type", DEFAULT_FORM["compute_type"])).strip().lower()
+    concept_style = (
+        str(form.get("concept_style", DEFAULT_FORM["concept_style"])).strip().lower()
+        or DEFAULT_FORM["concept_style"]
+    )
 
     if device not in ALLOWED_DEVICES:
         device = DEFAULT_FORM["device"]
     if compute_type not in ALLOWED_COMPUTE_TYPES:
         compute_type = DEFAULT_FORM["compute_type"]
+    if concept_style not in CONCEPT_STYLE_CHOICES:
+        concept_style = DEFAULT_FORM["concept_style"]
 
     return {
         "urls_text": str(form.get("urls_text", "")).strip(),
         "model": str(form.get("model", DEFAULT_FORM["model"])).strip() or DEFAULT_FORM["model"],
         "language": str(form.get("language", DEFAULT_FORM["language"])).strip(),
         "translate_to": str(form.get("translate_to", DEFAULT_FORM["translate_to"])).strip(),
+        "concept_style": concept_style,
         "device": device,
         "compute_type": compute_type,
         "beam_size": beam_size,
@@ -195,6 +203,7 @@ def run_batch_download(form_data: dict[str, Any]) -> dict[str, Any]:
                 beam_size=int(form_data["beam_size"]),
                 prompt_hint=form_data["prompt_hint"],
                 translate_to=form_data["translate_to"],
+                concept_style=form_data["concept_style"],
                 keep_audio=form_data["keep_audio"],
             )
             title = result["info"].get("title") or url
