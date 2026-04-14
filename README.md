@@ -1,6 +1,6 @@
-# YouTube Subtitle Notebook Toolkit
+# youtubu_translater
 
-Small notebook helpers for downloading YouTube lecture audio/video, generating subtitles with `faster-whisper`, and previewing the result inside Jupyter.
+A small Codex-assisted toy project for downloading YouTube lecture media, generating subtitles with `faster-whisper`, and previewing the result inside Jupyter.
 
 ## Files
 
