@@ -73,7 +73,7 @@ function Ensure-Venv {
 function Test-Dependencies {
     param([string]$PythonExe)
 
-    $check = "import importlib.util, sys; mods = ('yt_dlp', 'faster_whisper', 'deep_translator'); missing = [m for m in mods if importlib.util.find_spec(m) is None]; sys.exit(0 if not missing else 1)"
+    $check = "import importlib.util, sys; mods = ('yt_dlp', 'faster_whisper', 'deep_translator', 'flask'); missing = [m for m in mods if importlib.util.find_spec(m) is None]; sys.exit(0 if not missing else 1)"
     & $PythonExe -c $check
     return $LASTEXITCODE -eq 0
 }
@@ -83,7 +83,7 @@ function Install-Dependencies {
 
     Write-Host "필요 패키지를 설치합니다. 첫 실행은 몇 분 걸릴 수 있습니다."
     & $PythonExe -m pip install --upgrade pip
-    & $PythonExe -m pip install yt-dlp faster-whisper deep-translator
+    & $PythonExe -m pip install yt-dlp faster-whisper deep-translator flask
 }
 
 $basePython = Get-PythonCommand

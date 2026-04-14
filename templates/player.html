@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ entry.title }} - Player</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+  </head>
+  <body>
+    <div class="page-shell player-shell">
+      <header class="player-header">
+        <div>
+          <p class="eyebrow">Saved Lecture</p>
+          <h1>{{ entry.title }}</h1>
+          <p class="hero-text">{{ entry.source_url or "Local media source" }}</p>
+        </div>
+        <a class="secondary-button" href="{{ url_for('index') }}">Back to Studio</a>
+      </header>
+
+      <main class="player-grid">
+        <section class="panel video-panel">
+          {% if video_url %}
+          <video controls preload="metadata" class="video-player">
+            <source src="{{ video_url }}" type="{{ video_mime }}">
+            {% if subtitle_url %}
+            <track src="{{ subtitle_url }}" kind="subtitles" srclang="ko" label="Subtitle" default>
+            {% endif %}
+          </video>
+          {% else %}
+          <div class="empty-state">
+            <h3>Video file is not ready.</h3>
+            <p>The player could not find or download the source video for this lecture yet.</p>
+          </div>
+          {% endif %}
+        </section>
+
+        <aside class="panel sidebar-panel">
+          <div class="panel-header">
+            <p class="panel-kicker">Assets</p>
+            <h2>Files</h2>
+          </div>
+          <div class="mini-list">
+            {% for item in download_links %}
+            <div class="mini-item">
+              <strong>{{ item.label }}</strong>
+              <a href="{{ item.url }}" target="_blank" rel="noreferrer">Open</a>
+            </div>
+            {% endfor %}
+          </div>
+
+          {% if player_log %}
+          <label class="field field-wide">
+            <span>Player Log</span>
+            <textarea rows="10" readonly>{{ player_log }}</textarea>
+          </label>
+          {% endif %}
+        </aside>
+      </main>
+    </div>
+  </body>
+</html>

@@ -7,6 +7,9 @@ A small Codex-assisted toy project for downloading YouTube lecture media, genera
 - `down.ipynb`: process one YouTube URL and create subtitle files.
 - `play.ipynb`: open a saved lecture video with subtitles inside Jupyter.
 - `down_seriese.ipynb`: process multiple YouTube URLs in one batch.
+- `web_app.py`: local Flask web app for browser-based download and playback.
+- `run_web_app.ps1`: launch the browser UI with dependency setup.
+- `start_web_ui.bat`: double-click launcher for Windows.
 - `youtube_subtitle_cli.py`: shared download / transcription logic.
 - `jupyter_video_helper.py`: notebook helpers for playback and subtitle matching.
 - `make_youtube_subs.ps1`: PowerShell entry point for setting up dependencies and running the CLI.
@@ -17,6 +20,13 @@ A small Codex-assisted toy project for downloading YouTube lecture media, genera
 2. Replace the URL value with your target YouTube link or links.
 3. Run all cells.
 4. Open `play.ipynb` to preview a lecture with subtitles.
+
+## Browser UI
+
+1. Run `start_web_ui.bat` or `.\run_web_app.ps1`.
+2. Open the local address shown in the terminal.
+3. Paste one or many URLs in the browser and run the batch.
+4. Open saved lectures from the library section.
 
 ## Notes
 

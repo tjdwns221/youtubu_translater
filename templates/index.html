@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>YouTube Subtitle Studio</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+  </head>
+  <body>
+    <div class="page-shell">
+      <header class="hero">
+        <div class="hero-copy">
+          <p class="eyebrow">YouTube Subtitle Studio</p>
+          <h1>Browser-first batch subtitles for lecture playlists.</h1>
+          <p class="hero-text">
+            Paste one or many YouTube URLs, run GPU transcription, and reopen saved lectures with subtitles in the browser.
+          </p>
+        </div>
+        <div class="hero-panel">
+          <div class="metric-card">
+            <span class="metric-label">Saved Lectures</span>
+            <strong class="metric-value">{{ entries|length }}</strong>
+          </div>
+          <div class="metric-card">
+            <span class="metric-label">Default Device</span>
+            <strong class="metric-value">{{ form_data.device }}</strong>
+          </div>
+        </div>
+      </header>
+
+      <main class="layout-grid">
+        <section class="panel form-panel">
+          <div class="panel-header">
+            <p class="panel-kicker">Download</p>
+            <h2>Queue URLs</h2>
+          </div>
+          <form method="post" class="download-form">
+            <label class="field field-wide">
+              <span>URLs</span>
+              <textarea name="urls_text" rows="8" placeholder="One YouTube URL per line">{{ form_data.urls_text }}</textarea>
+            </label>
+
+            <div class="field-grid">
+              <label class="field">
+                <span>Model</span>
+                <input type="text" name="model" value="{{ form_data.model }}">
+              </label>
+              <label class="field">
+                <span>Beam Size</span>
+                <input type="number" name="beam_size" value="{{ form_data.beam_size }}" min="1" step="1">
+              </label>
+              <label class="field">
+                <span>Language</span>
+                <input type="text" name="language" value="{{ form_data.language }}" placeholder="auto detect if empty">
+              </label>
+              <label class="field">
+                <span>Translate To</span>
+                <input type="text" name="translate_to" value="{{ form_data.translate_to }}">
+              </label>
+              <label class="field">
+                <span>Device</span>
+                <select name="device">
+                  {% for option in ["cuda", "auto", "cpu"] %}
+                  <option value="{{ option }}" {% if form_data.device == option %}selected{% endif %}>{{ option }}</option>
+                  {% endfor %}
+                </select>
+              </label>
+              <label class="field">
+                <span>Compute Type</span>
+                <select name="compute_type">
+                  {% for option in ["float16", "auto", "int8", "int8_float16", "float32"] %}
+                  <option value="{{ option }}" {% if form_data.compute_type == option %}selected{% endif %}>{{ option }}</option>
+                  {% endfor %}
+                </select>
+              </label>
+            </div>
+
+            <label class="field field-wide">
+              <span>Prompt Hint</span>
+              <input type="text" name="prompt_hint" value="{{ form_data.prompt_hint }}" placeholder="Optional terminology hint">
+            </label>
+
+            <div class="toggle-row">
+              <label class="toggle">
+                <input type="checkbox" name="keep_audio" {% if form_data.keep_audio %}checked{% endif %}>
+                <span>Keep downloaded audio</span>
+              </label>
+              <label class="toggle">
+                <input type="checkbox" name="continue_on_error" {% if form_data.continue_on_error %}checked{% endif %}>
+                <span>Continue on error</span>
+              </label>
+            </div>
+
+            <button class="primary-button" type="submit">Run Download Batch</button>
+          </form>
+        </section>
+
+        <section class="panel report-panel">
+          <div class="panel-header">
+            <p class="panel-kicker">Results</p>
+            <h2>Latest Run</h2>
+          </div>
+
+          {% if report %}
+          <div class="report-grid">
+            <article class="report-card">
+              <span class="metric-label">Success</span>
+              <strong class="metric-value">{{ report.successes|length }}</strong>
+            </article>
+            <article class="report-card report-card-danger">
+              <span class="metric-label">Failed</span>
+              <strong class="metric-value">{{ report.failures|length }}</strong>
+            </article>
+          </div>
+
+          {% if report.successes %}
+          <div class="mini-list">
+            {% for item in report.successes %}
+            <div class="mini-item">
+              <strong>{{ item.title }}</strong>
+              <a href="{{ url_for('player', video_id=item.video_id) }}">Open Player</a>
+            </div>
+            {% endfor %}
+          </div>
+          {% endif %}
+
+          {% if report.failures %}
+          <div class="mini-list">
+            {% for item in report.failures %}
+            <div class="mini-item mini-item-danger">
+              <strong>{{ item.url or "Invalid input" }}</strong>
+              <span>{{ item.error }}</span>
+            </div>
+            {% endfor %}
+          </div>
+          {% endif %}
+
+          <label class="field field-wide">
+            <span>Console Log</span>
+            <textarea rows="16" readonly>{{ report.log_text }}</textarea>
+          </label>
+          {% else %}
+          <div class="empty-state">
+            <h3>Nothing has run yet.</h3>
+            <p>Paste URLs on the left and this panel will fill with the latest logs and quick links.</p>
+          </div>
+          {% endif %}
+        </section>
+      </main>
+
+      <section class="panel library-panel">
+        <div class="panel-header">
+          <p class="panel-kicker">Library</p>
+          <h2>Saved lectures</h2>
+        </div>
+
+        {% if entries %}
+        <div class="library-grid">
+          {% for entry in entries %}
+          <article class="library-card">
+            <div class="library-meta">
+              <span class="pill">{{ "video ready" if entry.video_path else "subtitle only" }}</span>
+              <span class="subtle">{{ entry.video_id }}</span>
+            </div>
+            <h3>{{ entry.title }}</h3>
+            <p class="card-copy">{{ entry.source_url or "Saved from a local media source." }}</p>
+            <div class="action-row">
+              <a class="secondary-button" href="{{ url_for('player', video_id=entry.video_id) }}">Open Player</a>
+              {% if entry.source_url %}
+              <a class="text-link" href="{{ entry.source_url }}" target="_blank" rel="noreferrer">Open YouTube</a>
+              {% endif %}
+            </div>
+          </article>
+          {% endfor %}
+        </div>
+        {% else %}
+        <div class="empty-state">
+          <h3>Your library is empty.</h3>
+          <p>Run one download first, then saved lectures will appear here.</p>
+        </div>
+        {% endif %}
+      </section>
+    </div>
+  </body>
+</html>
