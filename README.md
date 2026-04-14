@@ -1,5 +1,5 @@
 # youtubu_translater
-
+영어강의 들어야 되는데 영어를 못하는 사람을 위해 만든 toy-project codex랑 만들었음
 A small Codex-assisted toy project for downloading YouTube lecture media, generating subtitles with `faster-whisper`, and previewing the result inside Jupyter.
 
 ## Files
