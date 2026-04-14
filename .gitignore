@@ -1,0 +1,16 @@
+.ipynb_checkpoints/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+.youtube_subs_env/
+
+youtube_subs/audio/
+youtube_subs/models/
+youtube_subs/video/
+youtube_subs/*.json
+youtube_subs/*.srt
+youtube_subs/*.vtt
+youtube_subs/*.txt
+
