@@ -4,13 +4,18 @@ import contextlib
 import io
 import json
 import os
+import subprocess
+import sys
+import threading
+import time
+import uuid
 from pathlib import Path
 from typing import Any
 
 from flask import Flask, abort, render_template, request, send_from_directory, url_for
 
 from jupyter_video_helper import choose_subtitle_for_stem, find_matching_video, srt_to_vtt
-from youtube_subtitle_cli import CONCEPT_STYLE_CHOICES, download_video, run_job
+from youtube_subtitle_cli import CONCEPT_STYLE_CHOICES, download_video, load_saved_job, run_job
 
 
 APP_ROOT = Path(__file__).resolve().parent
@@ -34,6 +39,11 @@ DEFAULT_FORM = {
 }
 
 app = Flask(__name__)
+
+JOBS_LOCK = threading.Lock()
+JOBS: dict[str, dict[str, Any]] = {}
+MAX_LOG_CHARS = 120_000
+MAX_STORED_JOBS = 18
 
 
 def parse_urls_text(urls_text: str) -> list[str]:
@@ -175,22 +185,222 @@ def normalize_form_data(form: Any) -> dict[str, Any]:
     }
 
 
-def run_batch_download(form_data: dict[str, Any]) -> dict[str, Any]:
-    urls = parse_urls_text(form_data["urls_text"])
-    report = {
+def create_report(urls: list[str]) -> dict[str, Any]:
+    return {
+        "job_id": "",
+        "status": "idle",
         "urls": urls,
+        "total_urls": len(urls),
+        "current_index": 0,
+        "current_url": "",
         "successes": [],
         "failures": [],
         "log_text": "",
+        "started_at": None,
+        "finished_at": None,
     }
+
+
+def copy_report(report: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "job_id": report.get("job_id", ""),
+        "status": report.get("status", "idle"),
+        "urls": list(report.get("urls", [])),
+        "total_urls": int(report.get("total_urls", 0)),
+        "current_index": int(report.get("current_index", 0)),
+        "current_url": report.get("current_url", ""),
+        "successes": [dict(item) for item in report.get("successes", [])],
+        "failures": [dict(item) for item in report.get("failures", [])],
+        "log_text": report.get("log_text", ""),
+        "started_at": report.get("started_at"),
+        "finished_at": report.get("finished_at"),
+    }
+
+
+def append_log_text(report: dict[str, Any], text: str) -> None:
+    if not text:
+        return
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    report["log_text"] = (report.get("log_text", "") + normalized)[-MAX_LOG_CHARS:]
+
+
+def get_job_report(job_id: str) -> dict[str, Any] | None:
+    with JOBS_LOCK:
+        report = JOBS.get(job_id)
+        return copy_report(report) if report else None
+
+
+def update_job_report(job_id: str, callback) -> dict[str, Any] | None:
+    with JOBS_LOCK:
+        report = JOBS.get(job_id)
+        if report is None:
+            return None
+        callback(report)
+        return copy_report(report)
+
+
+def prune_finished_jobs() -> None:
+    with JOBS_LOCK:
+        if len(JOBS) <= MAX_STORED_JOBS:
+            return
+        removable = sorted(
+            JOBS.items(),
+            key=lambda item: item[1].get("finished_at") or item[1].get("started_at") or 0,
+        )
+        while len(JOBS) > MAX_STORED_JOBS and removable:
+            job_id, report = removable.pop(0)
+            if report.get("status") == "running":
+                continue
+            JOBS.pop(job_id, None)
+
+
+def build_cli_command(url: str, form_data: dict[str, Any]) -> list[str]:
+    command = [
+        sys.executable,
+        "-u",
+        str(APP_ROOT / "youtube_subtitle_cli.py"),
+        "--url",
+        url,
+        "--output-dir",
+        str(OUTPUT_DIR),
+        "--model",
+        form_data["model"],
+        "--device",
+        form_data["device"],
+        "--compute-type",
+        form_data["compute_type"],
+        "--beam-size",
+        str(int(form_data["beam_size"])),
+        "--concept-style",
+        form_data["concept_style"],
+    ]
+    if form_data["language"]:
+        command += ["--language", form_data["language"]]
+    if form_data["translate_to"]:
+        command += ["--translate-to", form_data["translate_to"]]
+    if form_data["prompt_hint"]:
+        command += ["--prompt-hint", form_data["prompt_hint"]]
+    if form_data["keep_audio"]:
+        command.append("--keep-audio")
+    return command
+
+
+def run_cli_download(job_id: str, url: str, form_data: dict[str, Any]) -> dict[str, Any]:
+    command = build_cli_command(url, form_data)
+    process = subprocess.Popen(
+        command,
+        cwd=str(APP_ROOT),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+    )
+
+    assert process.stdout is not None
+    try:
+        for chunk in process.stdout:
+            update_job_report(job_id, lambda report, part=chunk: append_log_text(report, part))
+    finally:
+        process.stdout.close()
+
+    return_code = process.wait()
+    if return_code != 0:
+        raise RuntimeError(f"Subtitle job exited with code {return_code}.")
+
+    saved_job = load_saved_job(url, OUTPUT_DIR)
+    if not saved_job:
+        raise RuntimeError("The download finished, but no saved subtitle entry was found.")
+    return saved_job
+
+
+def run_background_job(job_id: str, form_data: dict[str, Any]) -> None:
+    urls = parse_urls_text(form_data["urls_text"])
+
+    def start_report(report: dict[str, Any]) -> None:
+        report["status"] = "running"
+        report["started_at"] = time.time()
+        append_log_text(report, f"Queued {len(urls)} URL(s).\n")
+
+    update_job_report(job_id, start_report)
+
     if not urls:
+        def fail_empty(report: dict[str, Any]) -> None:
+            report["status"] = "failed"
+            report["finished_at"] = time.time()
+            report["failures"].append({"url": "", "error": "Paste at least one YouTube URL."})
+            append_log_text(report, "No URLs were provided.\n")
+
+        update_job_report(job_id, fail_empty)
+        return
+
+    for index, url in enumerate(urls, start=1):
+        def mark_current(report: dict[str, Any], current_index=index, current_url=url) -> None:
+            report["current_index"] = current_index
+            report["current_url"] = current_url
+            append_log_text(report, f"\n[{current_index}/{report['total_urls']}] {current_url}\n")
+
+        update_job_report(job_id, mark_current)
+
+        try:
+            saved_job = run_cli_download(job_id, url, form_data)
+            info = saved_job["info"]
+            title = info.get("title") or url
+            video_id = info.get("id") or title
+
+            def mark_success(report: dict[str, Any], item_title=title, item_url=url, item_video_id=video_id) -> None:
+                report["successes"].append(
+                    {
+                        "url": item_url,
+                        "title": item_title,
+                        "video_id": item_video_id,
+                    }
+                )
+                append_log_text(report, f"Finished: {item_title}\n")
+
+            update_job_report(job_id, mark_success)
+        except Exception as exc:
+            error_text = str(exc)
+
+            def mark_failure(report: dict[str, Any], item_url=url, item_error=error_text) -> None:
+                report["failures"].append({"url": item_url, "error": item_error})
+                append_log_text(report, f"ERROR: {item_error}\n")
+
+            update_job_report(job_id, mark_failure)
+            if not form_data["continue_on_error"]:
+                break
+
+    def finish_report(report: dict[str, Any]) -> None:
+        report["finished_at"] = time.time()
+        report["current_url"] = ""
+        report["current_index"] = report["total_urls"]
+        if report["failures"] and report["successes"]:
+            report["status"] = "completed_with_errors"
+        elif report["failures"]:
+            report["status"] = "failed"
+        else:
+            report["status"] = "completed"
+
+    update_job_report(job_id, finish_report)
+    prune_finished_jobs()
+
+
+def run_batch_download(form_data: dict[str, Any]) -> dict[str, Any]:
+    urls = parse_urls_text(form_data["urls_text"])
+    report = create_report(urls)
+    if not urls:
+        report["status"] = "failed"
         report["failures"].append({"url": "", "error": "Paste at least one YouTube URL."})
         report["log_text"] = "No URLs were provided."
         return report
 
-    all_logs: list[str] = []
+    report["status"] = "running"
+    report["started_at"] = time.time()
     for index, url in enumerate(urls, start=1):
-        all_logs.append(f"[{index}/{len(urls)}] {url}")
+        report["current_index"] = index
+        report["current_url"] = url
+        append_log_text(report, f"\n[{index}/{len(urls)}] {url}\n")
         try:
             result, logs = capture_output(
                 run_job,
@@ -214,14 +424,23 @@ def run_batch_download(form_data: dict[str, Any]) -> dict[str, Any]:
                     "video_id": result["info"].get("id") or title,
                 }
             )
-            all_logs.append(logs.strip() or f"Finished: {title}")
+            append_log_text(report, (logs.strip() + "\n") if logs.strip() else f"Finished: {title}\n")
         except Exception as exc:
             report["failures"].append({"url": url, "error": str(exc)})
-            all_logs.append(f"ERROR: {exc}")
+            append_log_text(report, f"ERROR: {exc}\n")
             if not form_data["continue_on_error"]:
                 break
 
-    report["log_text"] = "\n\n".join(part for part in all_logs if part).strip()
+    report["finished_at"] = time.time()
+    report["current_url"] = ""
+    report["current_index"] = report["total_urls"]
+    if report["failures"] and report["successes"]:
+        report["status"] = "completed_with_errors"
+    elif report["failures"]:
+        report["status"] = "failed"
+    else:
+        report["status"] = "completed"
+    report["log_text"] = report["log_text"].strip()
     return report
 
 
@@ -234,6 +453,9 @@ def index():
         form_data = normalize_form_data(request.form)
         report = run_batch_download(form_data)
     else:
+        requested_job_id = request.args.get("job_id", "").strip()
+        if requested_job_id:
+            report = get_job_report(requested_job_id)
         sample_urls = [entry["source_url"] for entry in list_library_entries()[:3] if entry["source_url"]]
         if sample_urls:
             form_data["urls_text"] = "\n".join(sample_urls[:2])
@@ -245,6 +467,36 @@ def index():
         form_data=form_data,
         report=report,
     )
+
+
+@app.route("/api/jobs", methods=["POST"])
+def create_job():
+    form_data = normalize_form_data(request.form)
+    urls = parse_urls_text(form_data["urls_text"])
+    report = create_report(urls)
+    job_id = uuid.uuid4().hex[:12]
+    report["job_id"] = job_id
+
+    with JOBS_LOCK:
+        JOBS[job_id] = report
+
+    worker = threading.Thread(target=run_background_job, args=(job_id, form_data), daemon=True)
+    worker.start()
+    prune_finished_jobs()
+
+    return {
+        "job_id": job_id,
+        "status_url": url_for("job_status", job_id=job_id),
+        "report_url": url_for("index", job_id=job_id),
+    }, 202
+
+
+@app.route("/api/jobs/<job_id>")
+def job_status(job_id: str):
+    report = get_job_report(job_id)
+    if report is None:
+        abort(404)
+    return report
 
 
 @app.route("/player/<video_id>")

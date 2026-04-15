@@ -34,7 +34,7 @@
             <p class="panel-kicker">Download</p>
             <h2>Queue URLs</h2>
           </div>
-          <form method="post" class="download-form">
+          <form method="post" action="{{ url_for('index') }}" class="download-form" id="download-form">
             <label class="field field-wide">
               <span>URLs</span>
               <textarea name="urls_text" rows="8" placeholder="One YouTube URL per line">{{ form_data.urls_text }}</textarea>
@@ -103,7 +103,8 @@
               </label>
             </div>
 
-            <button class="primary-button" type="submit">Run Download Batch</button>
+            <button class="primary-button" id="submit-button" type="submit">Run Download Batch</button>
+            <p class="subtle live-hint" id="live-note">New batches start in the background and stream progress here.</p>
           </form>
         </section>
 
@@ -113,50 +114,88 @@
             <h2>Latest Run</h2>
           </div>
 
-          {% if report %}
+          {% set total_urls = report.total_urls if report else 0 %}
+          {% set completed_urls = (report.successes|length + report.failures|length) if report else 0 %}
+          {% set progress_percent = ((completed_urls / total_urls) * 100) if total_urls else 0 %}
           <div class="report-grid">
             <article class="report-card">
+              <span class="metric-label">Status</span>
+              <strong class="metric-value metric-value-compact" id="job-status">{{ report.status|replace("_", " ")|title if report else "Idle" }}</strong>
+            </article>
+            <article class="report-card">
+              <span class="metric-label">Queue</span>
+              <strong class="metric-value metric-value-compact" id="job-progress">{{ completed_urls }}/{{ total_urls }}</strong>
+            </article>
+            <article class="report-card">
               <span class="metric-label">Success</span>
-              <strong class="metric-value">{{ report.successes|length }}</strong>
+              <strong class="metric-value metric-value-compact" id="job-success-count">{{ report.successes|length if report else 0 }}</strong>
             </article>
             <article class="report-card report-card-danger">
               <span class="metric-label">Failed</span>
-              <strong class="metric-value">{{ report.failures|length }}</strong>
+              <strong class="metric-value metric-value-compact" id="job-failure-count">{{ report.failures|length if report else 0 }}</strong>
             </article>
           </div>
 
-          {% if report.successes %}
-          <div class="mini-list">
-            {% for item in report.successes %}
-            <div class="mini-item">
-              <strong>{{ item.title }}</strong>
-              <a href="{{ url_for('player', video_id=item.video_id) }}">Open Player</a>
+          <div class="progress-shell">
+            <div class="progress-copy">
+              <strong id="job-current-url">{{ report.current_url if report and report.current_url else "No active download yet." }}</strong>
+              <span class="subtle" id="job-phase-note">
+                {% if report and report.status in ["queued", "running"] %}
+                Batch is running in the background.
+                {% elif report %}
+                {{ progress_percent|round|int }}% complete
+                {% else %}
+                Ready
+                {% endif %}
+              </span>
             </div>
-            {% endfor %}
+            <div class="progress-track">
+              <span class="progress-bar" id="job-progress-bar" style="width: {{ progress_percent|round|int }}%"></span>
+            </div>
           </div>
-          {% endif %}
 
-          {% if report.failures %}
-          <div class="mini-list">
-            {% for item in report.failures %}
-            <div class="mini-item mini-item-danger">
-              <strong>{{ item.url or "Invalid input" }}</strong>
-              <span>{{ item.error }}</span>
+          <div class="stacked-lists">
+            <div>
+              <p class="metric-label">Completed Lectures</p>
+              <div class="mini-list" id="success-list">
+                {% if report and report.successes %}
+                {% for item in report.successes %}
+                <div class="mini-item">
+                  <strong>{{ item.title }}</strong>
+                  <a href="{{ url_for('player', video_id=item.video_id) }}">Open Player</a>
+                </div>
+                {% endfor %}
+                {% else %}
+                <div class="mini-item mini-item-muted">
+                  <span>Completed lectures will appear here.</span>
+                </div>
+                {% endif %}
+              </div>
             </div>
-            {% endfor %}
+
+            <div>
+              <p class="metric-label">Failures</p>
+              <div class="mini-list" id="failure-list">
+                {% if report and report.failures %}
+                {% for item in report.failures %}
+                <div class="mini-item mini-item-danger">
+                  <strong>{{ item.url or "Invalid input" }}</strong>
+                  <span>{{ item.error }}</span>
+                </div>
+                {% endfor %}
+                {% else %}
+                <div class="mini-item mini-item-muted">
+                  <span>Failures will appear here if something breaks.</span>
+                </div>
+                {% endif %}
+              </div>
+            </div>
           </div>
-          {% endif %}
 
           <label class="field field-wide">
             <span>Console Log</span>
-            <textarea rows="16" readonly>{{ report.log_text }}</textarea>
+            <textarea id="job-log" class="mono-log" rows="16" readonly>{% if report and report.log_text %}{{ report.log_text }}{% else %}Submit a batch to see live progress here.{% endif %}</textarea>
           </label>
-          {% else %}
-          <div class="empty-state">
-            <h3>Nothing has run yet.</h3>
-            <p>Paste URLs on the left and this panel will fill with the latest logs and quick links.</p>
-          </div>
-          {% endif %}
         </section>
       </main>
 
@@ -193,5 +232,186 @@
         {% endif %}
       </section>
     </div>
+
+    <script>
+      (() => {
+        const form = document.getElementById("download-form");
+        if (!form || !window.fetch) {
+          return;
+        }
+
+        const submitButton = document.getElementById("submit-button");
+        const statusEl = document.getElementById("job-status");
+        const progressEl = document.getElementById("job-progress");
+        const successEl = document.getElementById("job-success-count");
+        const failureEl = document.getElementById("job-failure-count");
+        const currentUrlEl = document.getElementById("job-current-url");
+        const phaseNoteEl = document.getElementById("job-phase-note");
+        const progressBarEl = document.getElementById("job-progress-bar");
+        const successListEl = document.getElementById("success-list");
+        const failureListEl = document.getElementById("failure-list");
+        const logEl = document.getElementById("job-log");
+        const liveNoteEl = document.getElementById("live-note");
+
+        let activeJobId = {{ (report.job_id if report and report.job_id else "")|tojson }};
+        let pollTimer = null;
+
+        function escapeHtml(value) {
+          return String(value)
+            .replaceAll("&", "&amp;")
+            .replaceAll("<", "&lt;")
+            .replaceAll(">", "&gt;")
+            .replaceAll("\"", "&quot;");
+        }
+
+        function formatStatus(status) {
+          const labels = {
+            idle: "Idle",
+            queued: "Queued",
+            running: "Running",
+            completed: "Completed",
+            completed_with_errors: "Completed With Errors",
+            failed: "Failed",
+          };
+          return labels[status] || String(status || "idle").replaceAll("_", " ");
+        }
+
+        function countUrls(text) {
+          return String(text || "")
+            .split(/\r?\n/)
+            .map((line) => line.trim())
+            .filter((line) => line && !line.startsWith("#")).length;
+        }
+
+        function renderItems(target, items, kind) {
+          if (!target) {
+            return;
+          }
+          if (!items || !items.length) {
+            const emptyText =
+              kind === "success"
+                ? "Completed lectures will appear here."
+                : "Failures will appear here if something breaks.";
+            target.innerHTML = `<div class="mini-item mini-item-muted"><span>${escapeHtml(emptyText)}</span></div>`;
+            return;
+          }
+
+          target.innerHTML = items
+            .map((item) => {
+              if (kind === "success") {
+                const href = item.video_id ? `/player/${encodeURIComponent(item.video_id)}` : "";
+                const link = href ? `<a href="${href}">Open Player</a>` : "";
+                return `<div class="mini-item"><strong>${escapeHtml(item.title || item.url || "Saved lecture")}</strong>${link}</div>`;
+              }
+              return `<div class="mini-item mini-item-danger"><strong>${escapeHtml(item.url || "Invalid input")}</strong><span>${escapeHtml(item.error || "Unknown error")}</span></div>`;
+            })
+            .join("");
+        }
+
+        function renderReport(report) {
+          const total = Number(report.total_urls || (report.urls ? report.urls.length : 0) || 0);
+          const successCount = report.successes ? report.successes.length : 0;
+          const failureCount = report.failures ? report.failures.length : 0;
+          const completed = successCount + failureCount;
+          const inFlight = report.status === "running" && report.current_url ? 1 : 0;
+          const progressUnits = total ? Math.min(total, completed + inFlight) : 0;
+          const progressPercent = total ? Math.round((progressUnits / total) * 100) : 0;
+          const running = report.status === "queued" || report.status === "running";
+
+          statusEl.textContent = formatStatus(report.status);
+          progressEl.textContent = `${progressUnits}/${total}`;
+          successEl.textContent = String(successCount);
+          failureEl.textContent = String(failureCount);
+          currentUrlEl.textContent = report.current_url || (total ? "Waiting for the next URL." : "No active download yet.");
+          phaseNoteEl.textContent = total ? `${progressPercent}% complete` : "Ready";
+          progressBarEl.style.width = `${progressPercent}%`;
+          logEl.value = report.log_text || "Submit a batch to see live progress here.";
+          renderItems(successListEl, report.successes || [], "success");
+          renderItems(failureListEl, report.failures || [], "failure");
+
+          submitButton.disabled = running;
+          submitButton.textContent = running ? "Download Running..." : "Run Download Batch";
+          liveNoteEl.textContent = running
+            ? "This batch is running in the background. The log below updates automatically."
+            : "New batches start in the background and stream progress here.";
+        }
+
+        async function pollJob(jobId) {
+          const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}`, {
+            cache: "no-store",
+            headers: { "X-Requested-With": "fetch" },
+          });
+          if (!response.ok) {
+            throw new Error("Could not load live job status.");
+          }
+
+          const report = await response.json();
+          renderReport(report);
+
+          if (report.status === "queued" || report.status === "running") {
+            pollTimer = window.setTimeout(() => {
+              pollJob(jobId).catch(() => {
+                submitButton.disabled = false;
+                submitButton.textContent = "Run Download Batch";
+              });
+            }, 900);
+            return;
+          }
+
+          const nextUrl = new URL(window.location.href);
+          nextUrl.searchParams.set("job_id", jobId);
+          window.history.replaceState({}, "", nextUrl);
+        }
+
+        form.addEventListener("submit", async (event) => {
+          event.preventDefault();
+
+          if (submitButton.disabled) {
+            return;
+          }
+
+          if (pollTimer) {
+            window.clearTimeout(pollTimer);
+          }
+
+          renderReport({
+            status: "queued",
+            total_urls: countUrls(form.elements.urls_text.value),
+            current_url: "Preparing the batch job...",
+            successes: [],
+            failures: [],
+            log_text: "Starting background job...\n",
+          });
+
+          try {
+            const response = await fetch("{{ url_for('create_job') }}", {
+              method: "POST",
+              body: new FormData(form),
+            });
+            if (!response.ok) {
+              throw new Error("Could not start the batch job.");
+            }
+
+            const payload = await response.json();
+            activeJobId = payload.job_id;
+            const nextUrl = new URL(window.location.href);
+            nextUrl.searchParams.set("job_id", activeJobId);
+            window.history.replaceState({}, "", nextUrl);
+            await pollJob(activeJobId);
+          } catch (error) {
+            submitButton.disabled = false;
+            submitButton.textContent = "Run Download Batch";
+            form.submit();
+          }
+        });
+
+        {% if report and report.job_id and report.status in ["queued", "running"] %}
+        pollJob(activeJobId).catch(() => {
+          submitButton.disabled = false;
+          submitButton.textContent = "Run Download Batch";
+        });
+        {% endif %}
+      })();
+    </script>
   </body>
 </html>

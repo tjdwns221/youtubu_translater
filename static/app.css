@@ -163,6 +163,10 @@ h3 {
   font-size: clamp(1.5rem, 2.2vw, 2.3rem);
 }
 
+.metric-value-compact {
+  font-size: clamp(1.2rem, 1.8vw, 1.8rem);
+}
+
 .layout-grid,
 .player-grid {
   display: grid;
@@ -274,6 +278,13 @@ textarea:focus {
   box-shadow: 0 14px 24px rgba(217, 108, 47, 0.26);
 }
 
+.primary-button:disabled {
+  cursor: wait;
+  opacity: 0.7;
+  transform: none;
+  box-shadow: none;
+}
+
 .secondary-button {
   background: var(--accent-soft);
   color: var(--accent-deep);
@@ -297,6 +308,12 @@ textarea:focus {
   gap: 12px;
 }
 
+.stacked-lists {
+  display: grid;
+  gap: 16px;
+  margin: 18px 0;
+}
+
 .report-grid {
   grid-template-columns: repeat(2, minmax(0, 1fr));
   margin-bottom: 14px;
@@ -317,6 +334,10 @@ textarea:focus {
 .mini-item {
   display: grid;
   gap: 5px;
+}
+
+.mini-item-muted {
+  background: rgba(255, 255, 255, 0.52);
 }
 
 .mini-item-danger {
@@ -346,6 +367,46 @@ textarea:focus {
   border-radius: 20px;
   background: rgba(255, 255, 255, 0.55);
   border: 1px dashed rgba(28, 26, 23, 0.14);
+}
+
+.progress-shell {
+  display: grid;
+  gap: 10px;
+  padding: 16px 18px;
+  border-radius: 20px;
+  background: rgba(255, 255, 255, 0.62);
+  border: 1px solid rgba(28, 26, 23, 0.08);
+}
+
+.progress-copy {
+  display: grid;
+  gap: 6px;
+}
+
+.progress-track {
+  position: relative;
+  height: 12px;
+  border-radius: 999px;
+  background: rgba(28, 26, 23, 0.08);
+  overflow: hidden;
+}
+
+.progress-bar {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--teal), var(--accent));
+  transition: width 0.25s ease;
+}
+
+.mono-log {
+  min-height: 280px;
+  font-family: Consolas, "SFMono-Regular", monospace;
+  line-height: 1.4;
+}
+
+.live-hint {
+  margin: 0;
 }
 
 .player-shell {
