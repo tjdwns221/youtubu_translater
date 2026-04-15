@@ -15,7 +15,15 @@ from typing import Any
 from flask import Flask, abort, render_template, request, send_from_directory, url_for
 
 from jupyter_video_helper import choose_subtitle_for_stem, find_matching_video, srt_to_vtt
-from youtube_subtitle_cli import CONCEPT_STYLE_CHOICES, download_video, load_saved_job, run_job
+from youtube_subtitle_cli import (
+    CONCEPT_STYLE_CHOICES,
+    DEFAULT_OLLAMA_HOST,
+    DEFAULT_OLLAMA_MODEL,
+    TRANSLATION_BACKEND_CHOICES,
+    download_video,
+    load_saved_job,
+    run_job,
+)
 
 
 APP_ROOT = Path(__file__).resolve().parent
@@ -30,6 +38,9 @@ DEFAULT_FORM = {
     "language": "",
     "translate_to": "ko",
     "concept_style": "ko_en",
+    "translation_backend": "ollama",
+    "llm_model": DEFAULT_OLLAMA_MODEL,
+    "ollama_host": DEFAULT_OLLAMA_HOST,
     "device": "cuda",
     "compute_type": "float16",
     "beam_size": "5",
@@ -162,6 +173,12 @@ def normalize_form_data(form: Any) -> dict[str, Any]:
         str(form.get("concept_style", DEFAULT_FORM["concept_style"])).strip().lower()
         or DEFAULT_FORM["concept_style"]
     )
+    translation_backend = (
+        str(form.get("translation_backend", DEFAULT_FORM["translation_backend"])).strip().lower()
+        or DEFAULT_FORM["translation_backend"]
+    )
+    llm_model = str(form.get("llm_model", DEFAULT_FORM["llm_model"])).strip() or DEFAULT_FORM["llm_model"]
+    ollama_host = str(form.get("ollama_host", DEFAULT_FORM["ollama_host"])).strip() or DEFAULT_FORM["ollama_host"]
 
     if device not in ALLOWED_DEVICES:
         device = DEFAULT_FORM["device"]
@@ -169,6 +186,8 @@ def normalize_form_data(form: Any) -> dict[str, Any]:
         compute_type = DEFAULT_FORM["compute_type"]
     if concept_style not in CONCEPT_STYLE_CHOICES:
         concept_style = DEFAULT_FORM["concept_style"]
+    if translation_backend not in TRANSLATION_BACKEND_CHOICES:
+        translation_backend = DEFAULT_FORM["translation_backend"]
 
     return {
         "urls_text": str(form.get("urls_text", "")).strip(),
@@ -176,6 +195,9 @@ def normalize_form_data(form: Any) -> dict[str, Any]:
         "language": str(form.get("language", DEFAULT_FORM["language"])).strip(),
         "translate_to": str(form.get("translate_to", DEFAULT_FORM["translate_to"])).strip(),
         "concept_style": concept_style,
+        "translation_backend": translation_backend,
+        "llm_model": llm_model,
+        "ollama_host": ollama_host,
         "device": device,
         "compute_type": compute_type,
         "beam_size": beam_size,
@@ -271,8 +293,14 @@ def build_cli_command(url: str, form_data: dict[str, Any]) -> list[str]:
         form_data["compute_type"],
         "--beam-size",
         str(int(form_data["beam_size"])),
+        "--translation-backend",
+        form_data["translation_backend"],
         "--concept-style",
         form_data["concept_style"],
+        "--llm-model",
+        form_data["llm_model"],
+        "--ollama-host",
+        form_data["ollama_host"],
     ]
     if form_data["language"]:
         command += ["--language", form_data["language"]]
@@ -414,6 +442,9 @@ def run_batch_download(form_data: dict[str, Any]) -> dict[str, Any]:
                 prompt_hint=form_data["prompt_hint"],
                 translate_to=form_data["translate_to"],
                 concept_style=form_data["concept_style"],
+                translation_backend=form_data["translation_backend"],
+                llm_model=form_data["llm_model"],
+                ollama_host=form_data["ollama_host"],
                 keep_audio=form_data["keep_audio"],
             )
             title = result["info"].get("title") or url

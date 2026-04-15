@@ -265,6 +265,9 @@ def ensure_outputs_for_url(
     prompt_hint: str = "",
     translate_to: str = "ko",
     concept_style: str = "auto",
+    translation_backend: str = "google",
+    llm_model: str = "translategemma:4b",
+    ollama_host: str = "http://127.0.0.1:11434",
     glossary_path: str | Path | None = None,
 ) -> dict[str, Path | dict | str | None]:
     existing = find_outputs_for_url(url, root=root, preferred_language=preferred_language)
@@ -286,6 +289,9 @@ def ensure_outputs_for_url(
         prompt_hint=prompt_hint,
         translate_to=translate_to,
         concept_style=concept_style,
+        translation_backend=translation_backend,
+        llm_model=llm_model,
+        ollama_host=ollama_host,
         glossary_path=glossary_path,
     )
     refreshed = find_outputs_for_url(url, root=root, preferred_language=preferred_language)
@@ -316,6 +322,9 @@ def show_video_for_url(
     prompt_hint: str = "",
     translate_to: str = "ko",
     concept_style: str = "auto",
+    translation_backend: str = "google",
+    llm_model: str = "translategemma:4b",
+    ollama_host: str = "http://127.0.0.1:11434",
     glossary_path: str | Path | None = None,
     base_dir: str | Path | None = None,
 ):
@@ -335,6 +344,9 @@ def show_video_for_url(
         prompt_hint=prompt_hint,
         translate_to=translate_to,
         concept_style=concept_style,
+        translation_backend=translation_backend,
+        llm_model=llm_model,
+        ollama_host=ollama_host,
         glossary_path=glossary_path,
     )
 

@@ -10,12 +10,18 @@ import sys
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 
 DLL_DIR_HANDLES: list[Any] = []
 VIDEO_EXTENSIONS = {".webm", ".mp4", ".mkv", ".mov", ".avi", ".m4v"}
 DEFAULT_GLOSSARY_PATH = Path(__file__).with_name("concept_glossary.json")
 CONCEPT_STYLE_CHOICES = {"auto", "plain", "ko", "ko_en", "en_ko"}
+TRANSLATION_BACKEND_CHOICES = {"auto", "google", "ollama"}
+DEFAULT_TRANSLATION_BACKEND = "google"
+DEFAULT_OLLAMA_MODEL = "translategemma:4b"
+DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -37,11 +43,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prompt-hint", default="", help="Optional hint to improve terminology.")
     parser.add_argument("--translate-to", default="", help="Translate transcript to target language code, e.g. ko.")
     parser.add_argument(
+        "--translation-backend",
+        default=DEFAULT_TRANSLATION_BACKEND,
+        choices=sorted(TRANSLATION_BACKEND_CHOICES),
+        help="Translation backend. Use ollama for the local LLM path.",
+    )
+    parser.add_argument(
         "--concept-style",
         default="auto",
         choices=sorted(CONCEPT_STYLE_CHOICES),
         help="How to render glossary concepts during translation. "
         "Examples: ko_en -> 강화학습(reinforcement learning), en_ko -> reinforcement learning(강화학습).",
+    )
+    parser.add_argument(
+        "--llm-model",
+        default=DEFAULT_OLLAMA_MODEL,
+        help="Local LLM model name when translation-backend=ollama. Example: translategemma:4b",
+    )
+    parser.add_argument(
+        "--ollama-host",
+        default=DEFAULT_OLLAMA_HOST,
+        help="Base URL for the local Ollama server.",
     )
     parser.add_argument(
         "--glossary-path",
@@ -69,6 +91,10 @@ def self_check() -> int:
     except Exception:
         translator_state = "missing"
     print(f"deep-translator: {translator_state}")
+    print(f"translation-backend-default: {DEFAULT_TRANSLATION_BACKEND}")
+    print(f"ollama-model : {DEFAULT_OLLAMA_MODEL}")
+    print(f"ollama-host  : {DEFAULT_OLLAMA_HOST}")
+    print(f"ollama-ready : {'yes' if ollama_model_available(DEFAULT_OLLAMA_MODEL, DEFAULT_OLLAMA_HOST) else 'no'}")
     cuda_device_count = 0
     try:
         cuda_device_count = int(ctranslate2.get_cuda_device_count())
@@ -315,6 +341,216 @@ def normalize_concept_style(target_language: str, concept_style: str) -> str:
     return style
 
 
+def normalize_translation_backend(translation_backend: str) -> str:
+    backend = (translation_backend or DEFAULT_TRANSLATION_BACKEND).strip().lower()
+    if backend not in TRANSLATION_BACKEND_CHOICES:
+        raise ValueError(f"Unsupported translation backend: {translation_backend}")
+    return backend
+
+
+def normalize_ollama_host(ollama_host: str) -> str:
+    host = (ollama_host or DEFAULT_OLLAMA_HOST).strip() or DEFAULT_OLLAMA_HOST
+    return host.rstrip("/")
+
+
+def ollama_request(
+    endpoint: str,
+    payload: dict[str, Any] | None = None,
+    ollama_host: str = DEFAULT_OLLAMA_HOST,
+    method: str = "POST",
+) -> dict[str, Any]:
+    host = normalize_ollama_host(ollama_host)
+    url = f"{host}{endpoint}"
+    body: bytes | None = None
+    headers = {"Content-Type": "application/json"}
+    if payload is not None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+    request = Request(url, data=body, headers=headers, method=method)
+    try:
+        with urlopen(request, timeout=120) as response:
+            raw = response.read().decode("utf-8")
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Ollama request failed ({exc.code}): {detail or exc.reason}") from exc
+    except URLError as exc:
+        raise RuntimeError(
+            f"Could not reach Ollama at {host}. Install/start Ollama first, or switch translation-backend to google."
+        ) from exc
+
+    if not raw.strip():
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Ollama returned invalid JSON: {raw[:200]}") from exc
+    if not isinstance(parsed, dict):
+        raise RuntimeError("Ollama returned an unexpected response shape.")
+    return parsed
+
+
+def ollama_list_models(ollama_host: str = DEFAULT_OLLAMA_HOST) -> list[str]:
+    payload = ollama_request("/api/tags", ollama_host=ollama_host, method="GET")
+    models = payload.get("models", [])
+    if not isinstance(models, list):
+        return []
+
+    names: list[str] = []
+    for item in models:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name", "")).strip()
+        if name:
+            names.append(name)
+    return names
+
+
+def ollama_model_available(model_name: str, ollama_host: str = DEFAULT_OLLAMA_HOST) -> bool:
+    wanted = model_name.strip().lower()
+    if not wanted:
+        return False
+    try:
+        available_models = ollama_list_models(ollama_host=ollama_host)
+    except RuntimeError:
+        return False
+    return any(name.lower() == wanted for name in available_models)
+
+
+def resolve_translation_backend(
+    target_language: str,
+    translation_backend: str,
+    llm_model: str = DEFAULT_OLLAMA_MODEL,
+    ollama_host: str = DEFAULT_OLLAMA_HOST,
+) -> str:
+    backend = normalize_translation_backend(translation_backend)
+    if not target_language.strip():
+        return backend
+
+    if backend == "auto":
+        return "ollama" if ollama_model_available(llm_model, ollama_host=ollama_host) else "google"
+    if backend == "ollama" and not ollama_model_available(llm_model, ollama_host=ollama_host):
+        raise RuntimeError(
+            f"Ollama model `{llm_model}` is not ready at {normalize_ollama_host(ollama_host)}. "
+            f"Run `ollama pull {llm_model}` first, or switch translation-backend to google."
+        )
+    return backend
+
+
+def iter_translation_batches(
+    items: list[tuple[int, str]],
+    max_items: int = 8,
+    max_chars: int = 1800,
+) -> list[list[tuple[int, str]]]:
+    batches: list[list[tuple[int, str]]] = []
+    current: list[tuple[int, str]] = []
+    current_chars = 0
+
+    for item in items:
+        _, text = item
+        item_chars = len(text)
+        if current and (len(current) >= max_items or current_chars + item_chars > max_chars):
+            batches.append(current)
+            current = []
+            current_chars = 0
+        current.append(item)
+        current_chars += item_chars
+
+    if current:
+        batches.append(current)
+    return batches
+
+
+def build_ollama_batch_prompt(
+    items: list[tuple[int, str]],
+    source_language: str,
+    target_language: str,
+) -> str:
+    source_label = source_language or "auto"
+    lines = [
+        f"Translate the subtitle items from {source_label} to {target_language}.",
+        "Return JSON that matches the provided schema.",
+        "Rules:",
+        "- Keep every id exactly as provided.",
+        "- Translate only the text field.",
+        "- Do not add explanations, summaries, or notes.",
+        "- Preserve tokens like YTSUBTERM0TOKEN exactly.",
+        "- Keep the Korean natural for lecture subtitles.",
+        "Items:",
+    ]
+    for index, text in items:
+        lines.append(json.dumps({"id": str(index), "text": text}, ensure_ascii=False))
+    return "\n".join(lines)
+
+
+def translate_batch_with_ollama(
+    items: list[tuple[int, str]],
+    source_language: str,
+    target_language: str,
+    llm_model: str = DEFAULT_OLLAMA_MODEL,
+    ollama_host: str = DEFAULT_OLLAMA_HOST,
+) -> dict[int, str]:
+    schema = {
+        "type": "object",
+        "properties": {
+            "translations": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "text": {"type": "string"},
+                    },
+                    "required": ["id", "text"],
+                },
+            }
+        },
+        "required": ["translations"],
+    }
+    prompt = build_ollama_batch_prompt(items, source_language=source_language, target_language=target_language)
+    payload = {
+        "model": llm_model,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+        "format": schema,
+        "options": {
+            "temperature": 0,
+        },
+    }
+    response = ollama_request("/api/chat", payload=payload, ollama_host=ollama_host)
+    message = response.get("message", {})
+    content = message.get("content", "") if isinstance(message, dict) else ""
+    if not isinstance(content, str) or not content.strip():
+        raise RuntimeError("Ollama returned an empty translation response.")
+
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Ollama returned non-JSON translation output: {content[:240]}") from exc
+
+    rows = parsed.get("translations", []) if isinstance(parsed, dict) else []
+    if not isinstance(rows, list):
+        raise RuntimeError("Ollama returned an invalid translation list.")
+
+    translated: dict[int, str] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        raw_id = str(row.get("id", "")).strip()
+        raw_text = segment_text(str(row.get("text", "")))
+        if not raw_id:
+            continue
+        try:
+            translated[int(raw_id)] = raw_text
+        except ValueError:
+            continue
+
+    expected_ids = {index for index, _ in items}
+    if set(translated) != expected_ids:
+        missing = sorted(expected_ids - set(translated))
+        raise RuntimeError(f"Ollama translation output was missing items: {missing[:5]}")
+    return translated
+
+
 def load_concept_glossary(glossary_path: str | Path | None = None) -> list[dict[str, Any]]:
     path = Path(glossary_path).resolve() if glossary_path else DEFAULT_GLOSSARY_PATH
     if not path.exists():
@@ -406,10 +642,16 @@ def restore_concept_tokens(text: str, replacements: dict[str, str]) -> str:
 def build_translation_metadata(
     target_language: str,
     concept_style: str,
+    translation_backend: str = DEFAULT_TRANSLATION_BACKEND,
+    llm_model: str = DEFAULT_OLLAMA_MODEL,
+    ollama_host: str = DEFAULT_OLLAMA_HOST,
     glossary_path: str | Path | None = None,
 ) -> dict[str, str]:
     target = target_language.strip().lower()
     style = normalize_concept_style(target, concept_style)
+    resolved_backend = normalize_translation_backend(translation_backend)
+    if resolved_backend == "auto":
+        resolved_backend = "ollama" if ollama_model_available(llm_model, ollama_host=ollama_host) else "google"
     glossary_name = ""
     if style != "plain":
         glossary_candidate = Path(glossary_path).resolve() if glossary_path else DEFAULT_GLOSSARY_PATH
@@ -418,6 +660,8 @@ def build_translation_metadata(
     return {
         "target_language": target,
         "concept_style": style,
+        "translation_backend": resolved_backend,
+        "llm_model": llm_model if resolved_backend == "ollama" else "",
         "glossary_name": glossary_name,
     }
 
@@ -500,15 +744,27 @@ def translation_metadata_matches(
     saved_meta: dict[str, Any],
     target_language: str,
     concept_style: str,
+    translation_backend: str = DEFAULT_TRANSLATION_BACKEND,
+    llm_model: str = DEFAULT_OLLAMA_MODEL,
+    ollama_host: str = DEFAULT_OLLAMA_HOST,
     glossary_path: str | Path | None = None,
 ) -> bool:
-    requested = build_translation_metadata(target_language, concept_style, glossary_path)
+    requested = build_translation_metadata(
+        target_language,
+        concept_style,
+        translation_backend=translation_backend,
+        llm_model=llm_model,
+        ollama_host=ollama_host,
+        glossary_path=glossary_path,
+    )
     saved_translation = saved_meta.get("translation", {}) if isinstance(saved_meta.get("translation", {}), dict) else {}
     if not saved_translation:
         return False
     return (
         saved_translation.get("target_language") == requested["target_language"]
         and saved_translation.get("concept_style") == requested["concept_style"]
+        and (saved_translation.get("translation_backend") or DEFAULT_TRANSLATION_BACKEND) == requested["translation_backend"]
+        and (saved_translation.get("llm_model") or "") == requested["llm_model"]
         and (saved_translation.get("glossary_name") or "") == requested["glossary_name"]
     )
 
@@ -541,12 +797,12 @@ def find_existing_downloaded_media(
     return None
 
 
-def translate_segments(
+def translate_segments_google(
     segments: list[dict[str, Any]],
     source_language: str,
     target_language: str,
-    concept_style: str = "auto",
-    glossary_path: str | Path | None = None,
+    resolved_concept_style: str,
+    glossary: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     try:
         from deep_translator import GoogleTranslator
@@ -556,26 +812,17 @@ def translate_segments(
             "Run make_youtube_subs.ps1 once, or install it with pip."
         ) from exc
 
-    if not target_language:
-        return segments
-
     src = source_language or "auto"
     target = target_language.strip().lower()
-    if src.lower() == target:
-        return segments
-
-    resolved_concept_style = normalize_concept_style(target, concept_style)
-    glossary = load_concept_glossary(glossary_path) if resolved_concept_style != "plain" else []
 
     translator = GoogleTranslator(source=src, target=target)
     cache: dict[str, str] = {}
     out: list[dict[str, Any]] = []
 
     print(f"Translating subtitles: {src} -> {target}")
+    print("Translation backend: google")
     if glossary:
-        glossary_origin = Path(glossary_path).resolve() if glossary_path else DEFAULT_GLOSSARY_PATH
         print(f"Concept style    : {resolved_concept_style}")
-        print(f"Concept glossary : {glossary_origin}")
 
     for item in segments:
         text = segment_text(item["text"])
@@ -616,6 +863,140 @@ def translate_segments(
         out.append(translated_item)
 
     return out
+
+
+def translate_segments_ollama(
+    segments: list[dict[str, Any]],
+    source_language: str,
+    target_language: str,
+    resolved_concept_style: str,
+    glossary: list[dict[str, Any]],
+    llm_model: str = DEFAULT_OLLAMA_MODEL,
+    ollama_host: str = DEFAULT_OLLAMA_HOST,
+) -> list[dict[str, Any]]:
+    src = source_language or "auto"
+    target = target_language.strip().lower()
+    cache: dict[str, str] = {}
+    out: list[dict[str, Any] | None] = [None] * len(segments)
+    pending: list[tuple[int, str, dict[str, str], str]] = []
+
+    print(f"Translating subtitles: {src} -> {target}")
+    print(f"Translation backend: ollama")
+    print(f"Ollama model     : {llm_model}")
+    print(f"Ollama host      : {normalize_ollama_host(ollama_host)}")
+    if glossary:
+        print(f"Concept style    : {resolved_concept_style}")
+
+    for index, item in enumerate(segments):
+        text = segment_text(item["text"])
+        translated_item = dict(item)
+        if not text:
+            out[index] = translated_item
+            continue
+
+        if text in cache:
+            translated_item["text"] = cache[text]
+            out[index] = translated_item
+            continue
+
+        protected_text = text
+        replacements: dict[str, str] = {}
+        if glossary:
+            protected_text, replacements = protect_concept_terms(
+                text,
+                glossary=glossary,
+                concept_style=resolved_concept_style,
+            )
+        pending.append((index, protected_text, replacements, text))
+
+    indexed_items = [(index, protected_text) for index, protected_text, _, _ in pending]
+    batches = iter_translation_batches(indexed_items)
+
+    for batch_index, batch in enumerate(batches, start=1):
+        print(f"Ollama batch     : {batch_index}/{len(batches)}")
+        try:
+            translated_map = translate_batch_with_ollama(
+                batch,
+                source_language=src,
+                target_language=target,
+                llm_model=llm_model,
+                ollama_host=ollama_host,
+            )
+        except Exception:
+            translated_map = {}
+            for single_index, single_text in batch:
+                single_result = translate_batch_with_ollama(
+                    [(single_index, single_text)],
+                    source_language=src,
+                    target_language=target,
+                    llm_model=llm_model,
+                    ollama_host=ollama_host,
+                )
+                translated_map.update(single_result)
+
+        for item_index, protected_text, replacements, original_text in pending:
+            if item_index not in translated_map:
+                continue
+            restored = restore_concept_tokens(
+                segment_text(translated_map[item_index] or protected_text),
+                replacements,
+            )
+            restored = restored or original_text
+            cache[original_text] = restored
+            translated_item = dict(segments[item_index])
+            translated_item["text"] = restored
+            out[item_index] = translated_item
+
+    return [item if item is not None else dict(segments[index]) for index, item in enumerate(out)]
+
+
+def translate_segments(
+    segments: list[dict[str, Any]],
+    source_language: str,
+    target_language: str,
+    concept_style: str = "auto",
+    translation_backend: str = DEFAULT_TRANSLATION_BACKEND,
+    llm_model: str = DEFAULT_OLLAMA_MODEL,
+    ollama_host: str = DEFAULT_OLLAMA_HOST,
+    glossary_path: str | Path | None = None,
+) -> list[dict[str, Any]]:
+    if not target_language:
+        return segments
+
+    src = source_language or "auto"
+    target = target_language.strip().lower()
+    if src.lower() == target:
+        return segments
+
+    resolved_concept_style = normalize_concept_style(target, concept_style)
+    glossary = load_concept_glossary(glossary_path) if resolved_concept_style != "plain" else []
+    if glossary:
+        glossary_origin = Path(glossary_path).resolve() if glossary_path else DEFAULT_GLOSSARY_PATH
+        print(f"Concept glossary : {glossary_origin}")
+
+    resolved_backend = resolve_translation_backend(
+        target,
+        translation_backend,
+        llm_model=llm_model,
+        ollama_host=ollama_host,
+    )
+    if resolved_backend == "ollama":
+        return translate_segments_ollama(
+            segments,
+            source_language=source_language,
+            target_language=target_language,
+            resolved_concept_style=resolved_concept_style,
+            glossary=glossary,
+            llm_model=llm_model,
+            ollama_host=ollama_host,
+        )
+    return translate_segments_google(
+        segments,
+        source_language=source_language,
+        target_language=target_language,
+        resolved_concept_style=resolved_concept_style,
+        glossary=glossary,
+    )
 
 
 def download_media(url: str, output_dir: str | Path, media_kind: str) -> tuple[Path, dict[str, Any], bool]:
@@ -785,6 +1166,9 @@ def save_outputs(
     translated_segments: list[dict[str, Any]] | None = None,
     translate_to: str = "",
     concept_style: str = "auto",
+    translation_backend: str = DEFAULT_TRANSLATION_BACKEND,
+    llm_model: str = DEFAULT_OLLAMA_MODEL,
+    ollama_host: str = DEFAULT_OLLAMA_HOST,
     glossary_path: str | Path | None = None,
     translation_metadata: dict[str, str] | None = None,
 ) -> dict[str, Path]:
@@ -803,6 +1187,9 @@ def save_outputs(
         json_meta["translation"] = build_translation_metadata(
             translate_to,
             concept_style=concept_style,
+            translation_backend=translation_backend,
+            llm_model=llm_model,
+            ollama_host=ollama_host,
             glossary_path=glossary_path,
         )
 
@@ -842,6 +1229,9 @@ def run_job(
     prompt_hint: str = "",
     translate_to: str = "",
     concept_style: str = "auto",
+    translation_backend: str = DEFAULT_TRANSLATION_BACKEND,
+    llm_model: str = DEFAULT_OLLAMA_MODEL,
+    ollama_host: str = DEFAULT_OLLAMA_HOST,
     glossary_path: str | Path | None = None,
     keep_audio: bool = False,
 ) -> dict[str, Any]:
@@ -864,13 +1254,19 @@ def run_job(
             requested_translation = build_translation_metadata(
                 translate_to,
                 concept_style,
-                glossary_path,
+                translation_backend=translation_backend,
+                llm_model=llm_model,
+                ollama_host=ollama_host,
+                glossary_path=glossary_path,
             )
             if translation_metadata_matches(
                 saved_job["meta"],
                 translate_to,
                 concept_style,
-                glossary_path,
+                translation_backend=translation_backend,
+                llm_model=llm_model,
+                ollama_host=ollama_host,
+                glossary_path=glossary_path,
             ):
                 print(f"Reusing existing translated subtitles for URL: {url}")
                 return {
@@ -898,6 +1294,9 @@ def run_job(
                         saved_job["meta"],
                         translate_to=translate_to,
                         concept_style=concept_style,
+                        translation_backend=translation_backend,
+                        llm_model=llm_model,
+                        ollama_host=ollama_host,
                         glossary_path=glossary_path,
                         translation_metadata=requested_translation,
                     )
@@ -923,6 +1322,9 @@ def run_job(
                 source_language=saved_job["meta"].get("language", "") or language,
                 target_language=translate_to,
                 concept_style=concept_style,
+                translation_backend=translation_backend,
+                llm_model=llm_model,
+                ollama_host=ollama_host,
                 glossary_path=glossary_path,
             )
 
@@ -934,6 +1336,9 @@ def run_job(
             translated_segments=translated_segments,
             translate_to=translate_to,
             concept_style=concept_style,
+            translation_backend=translation_backend,
+            llm_model=llm_model,
+            ollama_host=ollama_host,
             glossary_path=glossary_path,
         )
         refreshed_job = load_saved_job(url, output_dir)
@@ -967,6 +1372,9 @@ def run_job(
                 source_language=meta.get("language", "") or language,
                 target_language=translate_to,
                 concept_style=concept_style,
+                translation_backend=translation_backend,
+                llm_model=llm_model,
+                ollama_host=ollama_host,
                 glossary_path=glossary_path,
             )
 
@@ -978,6 +1386,9 @@ def run_job(
             translated_segments=translated_segments,
             translate_to=translate_to,
             concept_style=concept_style,
+            translation_backend=translation_backend,
+            llm_model=llm_model,
+            ollama_host=ollama_host,
             glossary_path=glossary_path,
         )
         return {
@@ -1015,7 +1426,10 @@ def main() -> int:
         beam_size=args.beam_size,
         prompt_hint=args.prompt_hint,
         translate_to=args.translate_to,
+        translation_backend=args.translation_backend,
         concept_style=args.concept_style,
+        llm_model=args.llm_model,
+        ollama_host=args.ollama_host,
         glossary_path=args.glossary_path,
         keep_audio=args.keep_audio,
     )

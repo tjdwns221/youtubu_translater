@@ -21,8 +21,15 @@ param(
 
     [string]$TranslateTo = "",
 
+    [ValidateSet("auto", "google", "ollama")]
+    [string]$TranslationBackend = "google",
+
     [ValidateSet("auto", "plain", "ko", "ko_en", "en_ko")]
     [string]$ConceptStyle = "auto",
+
+    [string]$LlmModel = "translategemma:4b",
+
+    [string]$OllamaHost = "http://127.0.0.1:11434",
 
     [string]$GlossaryPath = "",
 
@@ -137,8 +144,20 @@ if (-not [string]::IsNullOrWhiteSpace($TranslateTo)) {
     $arguments += @("--translate-to", $TranslateTo)
 }
 
+if (-not [string]::IsNullOrWhiteSpace($TranslationBackend)) {
+    $arguments += @("--translation-backend", $TranslationBackend)
+}
+
 if (-not [string]::IsNullOrWhiteSpace($ConceptStyle)) {
     $arguments += @("--concept-style", $ConceptStyle)
+}
+
+if (-not [string]::IsNullOrWhiteSpace($LlmModel)) {
+    $arguments += @("--llm-model", $LlmModel)
+}
+
+if (-not [string]::IsNullOrWhiteSpace($OllamaHost)) {
+    $arguments += @("--ollama-host", $OllamaHost)
 }
 
 if (-not [string]::IsNullOrWhiteSpace($GlossaryPath)) {

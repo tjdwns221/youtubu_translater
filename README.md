@@ -11,6 +11,7 @@ A small Codex-assisted toy project for downloading YouTube lecture media, genera
 - `run_web_app.ps1`: launch the browser UI with dependency setup.
 - `start_web_ui.bat`: double-click launcher for Windows.
 - `concept_glossary.json`: editable concept glossary for term-preserving translation.
+- `setup_ollama_translator.ps1`: install/start Ollama and pull a local translation model.
 - `youtube_subtitle_cli.py`: shared download / transcription logic.
 - `jupyter_video_helper.py`: notebook helpers for playback and subtitle matching.
 - `make_youtube_subs.ps1`: PowerShell entry point for setting up dependencies and running the CLI.
@@ -29,10 +30,17 @@ A small Codex-assisted toy project for downloading YouTube lecture media, genera
 3. Paste one or many URLs in the browser and run the batch.
 4. Open saved lectures from the library section.
 
+## Local LLM Translation
+
+1. Run `.\setup_ollama_translator.ps1` once.
+2. Use `Translator = ollama` and `LLM Model = translategemma:4b` in the browser UI, or keep the notebook defaults.
+3. Keep Ollama running while subtitle translation is in progress.
+
 ## Notes
 
 - Default notebook settings use `cuda` and `float16` so GPU inference is preferred.
-- Default translation keeps key concepts as `한국어(English)` for better lecture comprehension.
+- Default notebook translation uses the local Ollama model `translategemma:4b`.
+- The local LLM path keeps key concepts as `한국어(English)` for better lecture comprehension.
 - You can edit `concept_glossary.json` to add your own preferred technical terms.
 - Generated outputs are written under `youtube_subs/`.
 - Large generated assets and local virtual environments are ignored by Git.

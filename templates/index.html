@@ -58,6 +58,14 @@
                 <input type="text" name="translate_to" value="{{ form_data.translate_to }}">
               </label>
               <label class="field">
+                <span>Translator</span>
+                <select name="translation_backend">
+                  {% for option in ["ollama", "google", "auto"] %}
+                  <option value="{{ option }}" {% if form_data.translation_backend == option %}selected{% endif %}>{{ option }}</option>
+                  {% endfor %}
+                </select>
+              </label>
+              <label class="field">
                 <span>Concept Style</span>
                 <select name="concept_style">
                   {% for option in ["ko_en", "en_ko", "ko", "plain", "auto"] %}
@@ -81,6 +89,14 @@
                   {% endfor %}
                 </select>
               </label>
+              <label class="field">
+                <span>LLM Model</span>
+                <input type="text" name="llm_model" value="{{ form_data.llm_model }}">
+              </label>
+              <label class="field">
+                <span>Ollama Host</span>
+                <input type="text" name="ollama_host" value="{{ form_data.ollama_host }}">
+              </label>
             </div>
 
             <label class="field field-wide">
@@ -90,6 +106,9 @@
             <p class="subtle">
               Edit <code>concept_glossary.json</code> if you want custom terms like
               <strong>정책 경사(policy gradient)</strong> or <strong>MDP(마르코프 결정 과정)</strong>.
+            </p>
+            <p class="subtle">
+              For local LLM translation, run <code>setup_ollama_translator.ps1</code> once and keep Ollama running.
             </p>
 
             <div class="toggle-row">
